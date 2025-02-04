@@ -31,7 +31,7 @@ If you have any questions, queries or comments, [Besu channel on Discord] is the
 
 To install the Besu binary, follow [these instructions](https://besu.hyperledger.org/public-networks/get-started/install/binary-distribution).    
 
-## Besu Developers
+## Besu Devs
 
 * [Contributing Guidelines]
 * [Coding Conventions](https://lf-hyperledger.atlassian.net/wiki/spaces/BESU/pages/22154259/Coding+Conventions)
