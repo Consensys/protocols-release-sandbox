@@ -1,0 +1,277 @@
+name: Release Publish
+
+run-name: "Release Publish ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+
+# Fires when the release engineer publishes the draft github release (with
+# immutable releases enabled, publish creates the final tag at the draft's
+# target sha and freezes the release forever).
+#
+# Nothing is rebuilt here. Docker promotion is a digest-preserving retag of
+# the RC images that burn-in validated (crane tag) — the manifest-list
+# digest, and therefore the build-time provenance attestation, carries over
+# to the final and latest tags unchanged.
+#
+# Privileged jobs run in the 'production' environment: required reviewer +
+# tag policy are enforced in repo settings (not in this file), and registry
+# secrets are not released to the jobs until the gate passes.
+#
+# workflow_dispatch is the recovery path (release-triggered workflows
+# resolve this file from the release tag's target sha, so post-tag fixes to
+# this file only apply via dispatch — 26.5.0 lesson, PR #10491).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to (re-)promote, e.g. 26.7.0"
+        required: true
+
+concurrency:
+  group: release-publish-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+
+env:
+  registry: docker.io
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    # Only final-version tags proceed: the strict x.y.z regex rejects RC/
+    # prerelease tags, so publishing anything suffixed does nothing.
+    if: github.event_name == 'workflow_dispatch' || github.event.release.draft == false
+    runs-on: ubuntu-24.04
+    environment: production
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      rc_tag: ${{ steps.rc.outputs.rc_tag }}
+      sha: ${{ steps.rc.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Parse release tag
+        id: parse
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+        run: |
+          RELEASE_TAG="${RELEASE_TAG//[[:space:]]/}"
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$RELEASE_TAG' is not a final version tag (x.y.z); refusing to promote"
+            exit 1
+          fi
+          echo "version=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.parse.outputs.version }}
+          fetch-depth: 0
+
+      - name: Resolve RC tag at the release sha
+        id: rc
+        # The release was published from a draft targeting the sha of the RC
+        # that passed burn-in. The highest RC tag pointing at that sha names
+        # the docker images to promote. No RC tag here = this release did
+        # not go through release-build.yml — fail loudly, never improvise.
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          sha=$(git rev-parse 'HEAD^{commit}')
+          rc_tag=$(git tag --points-at "$sha" | grep -E "^${VERSION}-RC[0-9]+$" | sort -V | tail -n 1)
+          if [[ -z "$rc_tag" ]]; then
+            echo "::error::no ${VERSION}-RC<n> tag points at ${sha}; this release was not built by release-build.yml"
+            exit 1
+          fi
+          echo "rc_tag=$rc_tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Promoting $rc_tag (@$sha) -> $VERSION"
+
+      - name: Verify release assets are complete
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          gh release view "$VERSION" --json assets --jq '.assets[].name' > assets.txt
+          for f in "besu-$VERSION.tar.gz" "besu-$VERSION.zip" \
+                   "besu-$VERSION.tar.gz.sha256" "besu-$VERSION.zip.sha256" \
+                   "besu-$VERSION.sbom.cdx.json" "besu-$VERSION.checksums.txt"; do
+            grep -qxF "$f" assets.txt || { echo "::error::release asset missing: $f"; exit 1; }
+          done
+          echo "All expected assets attached"
+
+  verify-provenance:
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      RC_TAG: ${{ needs.validate.outputs.rc_tag }}
+    steps:
+      - name: Download release assets
+        run: gh release download "$VERSION" -R "$GITHUB_REPOSITORY" --pattern 'besu-*'
+
+      - name: Verify checksums
+        run: |
+          shasum -a 256 -c "besu-$VERSION.tar.gz.sha256"
+          shasum -a 256 -c "besu-$VERSION.zip.sha256"
+          shasum -a 256 -c "besu-$VERSION.checksums.txt"
+
+      - name: Verify binary attestations
+        run: |
+          for f in "besu-$VERSION.tar.gz" "besu-$VERSION.zip"; do
+            gh attestation verify "$f" -R "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build-attested.yml"
+          done
+
+      - name: Verify RC image attestation
+        # Public image: digest resolution is an anonymous pull.
+        run: |
+          gh attestation verify "oci://docker.io/${{ secrets.DOCKER_ORG }}/besu:$RC_TAG" \
+            -R "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build-attested.yml"
+
+  docker-promote:
+    needs: [validate, verify-provenance]
+    runs-on: ubuntu-24.04
+    environment: production
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      RC_TAG: ${{ needs.validate.outputs.rc_tag }}
+    steps:
+      - name: Setup crane
+        # TODO: pin to SHA before merge
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Login to ${{ env.registry }}
+        run: crane auth login ${{ env.registry }} -u "${{ secrets.DOCKER_USER_RW }}" -p "${{ secrets.DOCKER_PASSWORD_RW }}"
+
+      - name: Promote tags (digest-preserving)
+        # crane tag points new tags at the EXISTING digests; nothing is
+        # rebuilt or re-manifested, so the build-time attestations remain
+        # valid for every promoted tag.
+        run: |
+          repo="${{ env.registry }}/${{ secrets.DOCKER_ORG }}/besu"
+          minor="${VERSION%.*}"
+
+          crane tag "$repo:$RC_TAG" "$VERSION"
+          crane tag "$repo:$RC_TAG" "$minor"
+          crane tag "$repo:$RC_TAG" latest
+          for arch in amd64 arm64; do
+            crane tag "$repo:$RC_TAG-$arch" "$VERSION-$arch"
+            crane tag "$repo:$RC_TAG-$arch" "latest-$arch"
+          done
+
+      - name: Assert digest continuity
+        run: |
+          repo="${{ env.registry }}/${{ secrets.DOCKER_ORG }}/besu"
+          rc=$(crane digest "$repo:$RC_TAG")
+          for tag in "$VERSION" latest; do
+            promoted=$(crane digest "$repo:$tag")
+            if [[ "$promoted" != "$rc" ]]; then
+              echo "::error::digest mismatch: $tag=$promoted, $RC_TAG=$rc"
+              exit 1
+            fi
+          done
+          echo "burn-in digest == published digest: $rc"
+
+  container-verify:
+    needs: [validate, docker-promote]
+    runs-on: ${{ matrix.combination.runner }}
+    timeout-minutes: 4
+    env:
+      CONTAINER_NAME: besu-check
+      VERSION: ${{ needs.validate.outputs.version }}
+    strategy:
+      matrix:
+        combination:
+          - tag: ${{ needs.validate.outputs.version }}
+            runner: ubuntu-24.04
+            check_latest: false
+          - tag: latest
+            runner: ubuntu-24.04
+            check_latest: true
+          - tag: latest-arm64
+            runner: ubuntu-24.04-arm
+            check_latest: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: '.github/workflows/BesuContainerVerify.sh'
+
+      - name: Start container
+        run: docker run -d --name ${{ env.CONTAINER_NAME }} ${{ secrets.DOCKER_ORG }}/besu:${{ matrix.combination.tag }}
+
+      - name: Verify besu container
+        run: bash .github/workflows/BesuContainerVerify.sh
+        env:
+          TAG: ${{ matrix.combination.tag }}
+          VERSION: ${{ env.VERSION }}
+          CHECK_LATEST: ${{ matrix.combination.check_latest }}
+
+      - name: Stop container
+        run: docker stop ${{ env.CONTAINER_NAME }}
+
+  maven:
+    needs: [validate, verify-provenance]
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RELEASE_VERSION }}
+
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Setup gradle
+        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+        with:
+          cache-disabled: true
+
+      - name: Artifactory publish
+        env:
+          ARTIFACTORY_USER: ${{ secrets.BESU_ARTIFACTORY_USER }}
+          ARTIFACTORY_KEY: ${{ secrets.BESU_ARTIFACTORY_TOKEN }}
+        run: ./gradlew -Prelease.releaseVersion=${{ env.RELEASE_VERSION }} -Pversion=${{ env.RELEASE_VERSION }} artifactoryPublish
+
+      - name: Attest published jars
+        id: jars
+        run: |
+          find . -path '*/build/libs/*.jar' -name "*-${RELEASE_VERSION}.jar" -print0 \
+            | xargs -0 shasum -a 256 > jar-checksums.txt
+          wc -l jar-checksums.txt
+
+      - name: Attest jar provenance
+        # TODO: pin to SHA before merge
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: jar-checksums.txt
+
+  verify-maven:
+    needs: [validate, maven]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.version }}
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install requests argparse
+
+      - name: Verify artifacts in Artifactory
+        run: python3 .github/workflows/verify_artifacts.py --besu_version="${{ needs.validate.outputs.version }}"

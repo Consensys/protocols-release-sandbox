@@ -1,0 +1,223 @@
+name: Build Attested
+
+# Reusable build-and-attest workflow. Running build + attest in a called
+# (reusable) workflow on GitHub-hosted runners is what qualifies the
+# provenance as SLSA v1 Build Level 3: user-defined build steps cannot reach
+# the signing material, and verifiers can pin this file via
+#   gh attestation verify <artifact> -R besu-eth/besu \
+#     --signer-workflow besu-eth/besu/.github/workflows/build-attested.yml
+#
+# Everything is built ONCE here, with the FINAL version embedded
+# (inputs.version, e.g. 26.7.0) regardless of the RC tag being built
+# (inputs.image-tag, e.g. 26.7.0-RC1). Promotion at publish time is a
+# digest-preserving retag, never a rebuild.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref (RC tag) to check out and build"
+        required: true
+        type: string
+      version:
+        description: "Final version embedded in artifacts, e.g. 26.7.0"
+        required: true
+        type: string
+      image-tag:
+        description: "Docker tag to push, e.g. 26.7.0-RC1"
+        required: true
+        type: string
+    outputs:
+      manifest-digest:
+        description: "Digest of the multi-arch docker manifest list"
+        value: ${{ jobs.docker-manifest.outputs.digest }}
+
+env:
+  registry: docker.io
+  GRADLE_OPTS: "-Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+
+jobs:
+  binaries:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Setup gradle
+        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+        with:
+          cache-disabled: true
+
+      - name: Assemble release
+        run: ./gradlew -Prelease.releaseVersion=${{ env.RELEASE_VERSION }} -Pversion=${{ env.RELEASE_VERSION }} assemble
+
+      - name: Generate SBOM
+        # TODO: pin to SHA before merge
+        uses: anchore/sbom-action@v0
+        with:
+          file: build/distributions/besu-${{ env.RELEASE_VERSION }}.tar.gz
+          format: cyclonedx-json
+          output-file: build/distributions/besu-${{ env.RELEASE_VERSION }}.sbom.cdx.json
+          upload-artifact: false
+
+      - name: Checksums
+        working-directory: build/distributions
+        run: |
+          shasum -a 256 besu-${{ env.RELEASE_VERSION }}.tar.gz > besu-${{ env.RELEASE_VERSION }}.tar.gz.sha256
+          shasum -a 256 besu-${{ env.RELEASE_VERSION }}.zip > besu-${{ env.RELEASE_VERSION }}.zip.sha256
+          shasum -a 256 \
+            besu-${{ env.RELEASE_VERSION }}.tar.gz \
+            besu-${{ env.RELEASE_VERSION }}.zip \
+            besu-${{ env.RELEASE_VERSION }}.sbom.cdx.json \
+            > besu-${{ env.RELEASE_VERSION }}.checksums.txt
+          cat besu-${{ env.RELEASE_VERSION }}.checksums.txt
+
+      - name: Attest build provenance
+        # TODO: pin to SHA before merge
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: build/distributions/besu-${{ env.RELEASE_VERSION }}.checksums.txt
+
+      - name: Attest SBOM
+        # TODO: pin to SHA before merge
+        uses: actions/attest-sbom@v4
+        with:
+          subject-path: build/distributions/besu-${{ env.RELEASE_VERSION }}.tar.gz
+          sbom-path: build/distributions/besu-${{ env.RELEASE_VERSION }}.sbom.cdx.json
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: besu-${{ env.RELEASE_VERSION }}-distributions
+          path: |
+            build/distributions/besu-${{ env.RELEASE_VERSION }}.tar.gz
+            build/distributions/besu-${{ env.RELEASE_VERSION }}.zip
+            build/distributions/besu-${{ env.RELEASE_VERSION }}.tar.gz.sha256
+            build/distributions/besu-${{ env.RELEASE_VERSION }}.zip.sha256
+            build/distributions/besu-${{ env.RELEASE_VERSION }}.sbom.cdx.json
+            build/distributions/besu-${{ env.RELEASE_VERSION }}.checksums.txt
+          compression-level: 0
+
+  docker:
+    # GitHub-hosted arm64 runners (GA, free for public repos) keep the whole
+    # build on ephemeral hosted infrastructure — required for SLSA L3.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Setup gradle
+        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+        with:
+          cache-disabled: true
+
+      - name: Login to ${{ env.registry }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ${{ env.registry }}
+          username: ${{ secrets.DOCKER_USER_RW }}
+          password: ${{ secrets.DOCKER_PASSWORD_RW }}
+
+      - name: Build and test docker image
+        env:
+          architecture: ${{ matrix.arch }}
+        # Builds the image locally as <org>/besu:<final-version> with the
+        # FINAL version embedded, so the startup banner is correct after the
+        # publish-time retag (26.5.0 lesson: retagged RC images self-reported
+        # the RC version).
+        run: ./gradlew --no-daemon testDocker -PdockerOrgName=${{ env.registry }}/${{ secrets.DOCKER_ORG }} -Pversion=${{ env.RELEASE_VERSION }} -Prelease.releaseVersion=${{ env.RELEASE_VERSION }}
+
+      - name: Push RC arch image
+        id: push
+        env:
+          architecture: ${{ matrix.arch }}
+        run: |
+          local_image="${{ env.registry }}/${{ secrets.DOCKER_ORG }}/besu:${{ env.RELEASE_VERSION }}"
+          rc_image="${{ env.registry }}/${{ secrets.DOCKER_ORG }}/besu:${{ env.IMAGE_TAG }}-${{ matrix.arch }}"
+          docker tag "$local_image" "$rc_image"
+          docker push "$rc_image"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$rc_image" | cut -d'@' -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $rc_image @ $digest"
+
+      - name: Attest image provenance
+        # TODO: pin to SHA before merge
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: index.docker.io/${{ secrets.DOCKER_ORG }}/besu
+          subject-digest: ${{ steps.push.outputs.digest }}
+
+  docker-manifest:
+    needs: [docker]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.create.outputs.digest }}
+    env:
+      IMAGE_TAG: ${{ inputs.image-tag }}
+    steps:
+      - name: Login to ${{ env.registry }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ${{ env.registry }}
+          username: ${{ secrets.DOCKER_USER_RW }}
+          password: ${{ secrets.DOCKER_PASSWORD_RW }}
+
+      - name: Create multi-arch manifest
+        id: create
+        run: |
+          repo="${{ env.registry }}/${{ secrets.DOCKER_ORG }}/besu"
+          docker buildx imagetools create \
+            --tag "$repo:${{ env.IMAGE_TAG }}" \
+            "$repo:${{ env.IMAGE_TAG }}-amd64" \
+            "$repo:${{ env.IMAGE_TAG }}-arm64"
+          digest=$(docker buildx imagetools inspect "$repo:${{ env.IMAGE_TAG }}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Manifest list $repo:${{ env.IMAGE_TAG }} @ $digest"
+
+      - name: Attest manifest provenance
+        # TODO: pin to SHA before merge
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: index.docker.io/${{ secrets.DOCKER_ORG }}/besu
+          subject-digest: ${{ steps.create.outputs.digest }}

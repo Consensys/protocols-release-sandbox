@@ -1136,114 +1136,6 @@ tasks.register("testDocker", Exec) {
   args "-c", "./test.sh ${image}"
 }
 
-task dockerUpload(type: Exec) {
-  dependsOn distDocker
-  def architecture = System.getenv('architecture')
-  def image = "${dockerImageName}:${dockerBuildVersion}"
-  def additionalTags = []
-
-  if (project.hasProperty('branch') && project.property('branch') == 'main') {
-    additionalTags.add('develop')
-  }
-
-  if (!isInterimBuild(dockerBuildVersion)) {
-    additionalTags.add(dockerBuildVersion.split(/\./)[0..1].join('.'))
-  }
-
-  def archVariantImage = "${image}-${architecture}"
-  def cmd = "docker tag '${image}' '${archVariantImage}' && docker push '${archVariantImage}'"
-
-  doFirst {
-    println "Executing '${cmd}'"
-  }
-
-  executable shell
-  args "-c", cmd
-}
-
-task dockerUploadReleaseArm64(type: Exec) {
-  def architecture = "arm64"
-  def image = "${dockerImageName}:${dockerBuildVersion}"
-
-  doFirst {
-    def cmd = "docker pull '${image}-${architecture}' && docker tag '${image}-${architecture}' '${dockerImageName}:latest-${architecture}' && docker push '${dockerImageName}:latest-${architecture}'"
-    println "Executing '${cmd}'"
-    commandLine shell, "-c", cmd
-  }
-}
-
-task dockerUploadReleaseAmd64(type: Exec) {
-  def architecture = "amd64"
-  def image = "${dockerImageName}:${dockerBuildVersion}"
-
-  doFirst {
-    def cmd = "docker pull '${image}-${architecture}' && docker tag '${image}-${architecture}' '${dockerImageName}:latest-${architecture}' && docker push '${dockerImageName}:latest-${architecture}'"
-    println "Executing '${cmd}'"
-    commandLine shell, "-c", cmd
-  }
-}
-
-task dockerUploadRelease {
-  dependsOn dockerUploadReleaseArm64, dockerUploadReleaseAmd64
-}
-
-task manifestDockerCreate(type: Exec) {
-  def image = "${dockerImageName}:${dockerBuildVersion}"
-  def archs = [
-    "arm64",
-    "amd64"] //TODO: this assumes dockerUpload task has already been run on 2 different archs!
-  doFirst {
-    def targets = ""
-    archs.forEach { arch -> targets += "'${image}-${arch}' " }
-    def cmd = "docker manifest create '${image}' ${targets}"
-    println "Executing '${cmd}'"
-    commandLine shell, "-c", cmd
-  }
-}
-
-task manifestDockerPush(type: Exec) {
-  dependsOn manifestDockerCreate
-  def image = "${dockerImageName}:${dockerBuildVersion}"
-
-  doFirst {
-    def cmd = "docker manifest push '${image}'"
-    println "Executing '${cmd}'"
-    commandLine shell, "-c", cmd
-  }
-}
-
-task manifestDocker {
-  dependsOn manifestDockerPush
-}
-
-task manifestDockerReleaseCreate(type: Exec) {
-  def archs = ["arm64", "amd64"]
-  def baseTag = "${dockerImageName}:latest"
-
-  doFirst {
-    def targets = ""
-    archs.forEach { arch -> targets += "'${baseTag}-${arch}' " }
-    def cmd = "docker manifest create '${baseTag}' ${targets} --amend"
-    println "Executing '${cmd}'"
-    commandLine shell, "-c", cmd
-  }
-}
-
-task manifestDockerReleasePush(type: Exec) {
-  dependsOn manifestDockerReleaseCreate
-  def baseTag = "${dockerImageName}:latest"
-
-  doFirst {
-    def cmd = "docker manifest push '${baseTag}'"
-    println "Executing '${cmd}'"
-    commandLine shell, "-c", cmd
-  }
-}
-
-task manifestDockerRelease {
-  dependsOn manifestDockerReleasePush
-}
-
 def sep = Pattern.quote(File.separator)
 
 jacocoTestReport {
@@ -1330,13 +1222,6 @@ def getGitCommitDetails(takeFromHash = 8) {
     logger.info('Error retrieving git commit details', e)
     return [hash: "xxxxxxxx", date: "00.0"]
   }
-}
-
-// Takes the version and if it contains SNAPSHOT, alpha, beta or RC in version then return true indicating an interim build
-def isInterimBuild(dockerBuildVersion) {
-  return (dockerBuildVersion ==~ /.*-SNAPSHOT/) || (dockerBuildVersion ==~ /.*-alpha/)
-  || (dockerBuildVersion ==~ /.*-beta/) || (dockerBuildVersion ==~ /.*-RC.*/)
-  || (dockerBuildVersion ==~ /.*develop.*/)
 }
 
 tasks.register("verifyDistributions") {

@@ -1,0 +1,293 @@
+name: Release Build
+
+run-name: "Release Build ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+
+# Pushing a signed RC tag (e.g. 26.7.0-RC1) is the entire release-candidate
+# ceremony. This workflow:
+#   1. validates the tag (format, signed annotated tag, reachable from
+#      main or a release-* branch)
+#   2. builds and attests everything ONCE via build-attested.yml (SLSA L3),
+#      with the FINAL version embedded
+#   3. smoke-tests the binaries and the pushed RC images
+#   4. creates or updates the DRAFT github release for the final version,
+#      targeting this RC's sha, with notes composed from CHANGELOG.md AT THE
+#      TAG (never from main — eliminates tag-vs-main drift)
+#
+# No github release object is ever created for the RC tag itself, and
+# nothing user-visible is published: draft releases are invisible, and RC
+# docker tags are explicitly RC-named and immutable.
+#
+# The workflow_dispatch trigger is the escape hatch for tags whose tree
+# predates this file (push-triggered workflows resolve from the tag's sha).
+
+on:
+  push:
+    tags:
+      - '2*-RC*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "RC tag to build, e.g. 26.7.0-RC1"
+        required: true
+
+concurrency:
+  group: release-build-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+env:
+  registry: docker.io
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      rc_tag: ${{ steps.parse.outputs.rc_tag }}
+      version: ${{ steps.parse.outputs.version }}
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Resolve and parse tag
+        id: parse
+        env:
+          RC_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          RC_TAG="${RC_TAG//[[:space:]]/}"
+          if [[ ! "$RC_TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-RC[0-9]+$ ]]; then
+            echo "::error::'$RC_TAG' is not a valid RC tag (expected e.g. 26.7.0-RC1)"
+            exit 1
+          fi
+          echo "rc_tag=$RC_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.parse.outputs.rc_tag }}
+          fetch-depth: 0
+
+      - name: Require signed annotated tag
+        # Tag rulesets cannot enforce tag signatures (github gap), so the
+        # pipeline checks. Full key verification is the reviewer's job at
+        # the environment gate; here we require the tag to be a signed tag
+        # object at all.
+        run: |
+          TAG="${{ steps.parse.outputs.rc_tag }}"
+          if [[ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]]; then
+            echo "::error::$TAG is a lightweight tag; release tags must be signed annotated tags (git tag -s)"
+            exit 1
+          fi
+          if ! git cat-file tag "refs/tags/$TAG" | grep -qE 'BEGIN (PGP|SSH) SIGNATURE'; then
+            echo "::error::$TAG is not signed; release tags must be signed (git tag -s)"
+            exit 1
+          fi
+
+      - name: Require tag on main or a release branch
+        run: |
+          git fetch --no-tags --quiet origin \
+            '+refs/heads/main:refs/remotes/origin/main' \
+            '+refs/heads/release-*:refs/remotes/origin/release-*'
+          sha=$(git rev-parse 'HEAD^{commit}')
+          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/origin/main 'refs/remotes/origin/release-*'); do
+            if git merge-base --is-ancestor "$sha" "$ref"; then
+              echo "$sha is reachable from $ref"
+              exit 0
+            fi
+          done
+          echo "::error::tag commit $sha is not reachable from main or any release-* branch"
+          exit 1
+
+      - name: Output sha
+        id: sha
+        run: echo "sha=$(git rev-parse 'HEAD^{commit}')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [validate]
+    uses: ./.github/workflows/build-attested.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      ref: ${{ needs.validate.outputs.rc_tag }}
+      version: ${{ needs.validate.outputs.version }}
+      image-tag: ${{ needs.validate.outputs.rc_tag }}
+    secrets: inherit
+
+  test-linux:
+    runs-on: ubuntu-24.04
+    needs: [validate, build]
+    timeout-minutes: 5
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: besu-${{ needs.validate.outputs.version }}-distributions
+
+      - name: Smoke test tar.gz
+        run: |
+          tar zxf besu-*.tar.gz
+          besu-${{ needs.validate.outputs.version }}/bin/besu --help
+          besu-${{ needs.validate.outputs.version }}/bin/besu --version
+
+  test-windows:
+    runs-on: windows-2022
+    needs: [validate, build]
+    timeout-minutes: 5
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: besu-${{ needs.validate.outputs.version }}-distributions
+
+      - name: Smoke test zip
+        run: |
+          unzip besu-*.zip -d besu-tmp
+          cd besu-tmp
+          mv besu-* ../besu
+          cd ..
+          besu\bin\besu.bat --help
+          besu\bin\besu.bat --version
+
+  container-verify:
+    needs: [validate, build]
+    runs-on: ${{ matrix.combination.runner }}
+    timeout-minutes: 4
+    env:
+      CONTAINER_NAME: besu-check
+    strategy:
+      matrix:
+        combination:
+          - tag: ${{ needs.validate.outputs.rc_tag }}
+            runner: ubuntu-24.04
+          - tag: ${{ needs.validate.outputs.rc_tag }}-amd64
+            runner: ubuntu-24.04
+          - tag: ${{ needs.validate.outputs.rc_tag }}-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: '.github/workflows/BesuContainerVerify.sh'
+
+      - name: Start container
+        run: docker run -d --name ${{ env.CONTAINER_NAME }} ${{ secrets.DOCKER_ORG }}/besu:${{ matrix.combination.tag }}
+
+      - name: Verify besu container
+        run: bash .github/workflows/BesuContainerVerify.sh
+        env:
+          TAG: ${{ matrix.combination.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          CHECK_LATEST: false
+
+      - name: Stop container
+        run: docker stop ${{ env.CONTAINER_NAME }}
+
+  draft-release:
+    runs-on: ubuntu-24.04
+    needs: [validate, build, test-linux, test-windows, container-verify]
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      RC_TAG: ${{ needs.validate.outputs.rc_tag }}
+      RC_SHA: ${{ needs.validate.outputs.sha }}
+      MANIFEST_DIGEST: ${{ needs.build.outputs.manifest-digest }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.RC_TAG }}
+
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: besu-${{ env.VERSION }}-distributions
+
+      - name: Compose release notes from CHANGELOG at the tag
+        run: |
+          # Extract the '## <version>' section (fall back to '## Unreleased'
+          # with a warning). The tag is the canonical reference for what
+          # shipped; main is never consulted.
+          extract_section() {
+            awk -v heading="## $1" '
+              $0 == heading {grab=1; next}
+              /^## / && grab {exit}
+              grab {print}
+            ' CHANGELOG.md
+          }
+          body=$(extract_section "${VERSION}")
+          if [[ -z "${body//[[:space:]]/}" ]]; then
+            echo "::warning::CHANGELOG.md at ${RC_TAG} has no '## ${VERSION}' section; falling back to '## Unreleased'"
+            body=$(extract_section "Unreleased")
+          fi
+          if [[ -z "${body//[[:space:]]/}" ]]; then
+            echo "::error::CHANGELOG.md at ${RC_TAG} has neither '## ${VERSION}' nor '## Unreleased' content. Fix the CHANGELOG and cut a new RC."
+            exit 1
+          fi
+
+          {
+            echo "## ${VERSION}"
+            echo "$body"
+            echo ""
+            echo "---"
+            echo "### Artifact integrity"
+            echo ""
+            echo "Docker multi-arch digest: \`${MANIFEST_DIGEST}\`"
+            echo ""
+            echo '```'
+            cat "besu-${VERSION}.checksums.txt"
+            echo '```'
+            echo ""
+            echo "### Verify provenance"
+            echo ""
+            echo "All artifacts carry SLSA Build L3 provenance:"
+            echo ""
+            echo '```'
+            echo "gh attestation verify besu-${VERSION}.tar.gz -R besu-eth/besu --signer-workflow besu-eth/besu/.github/workflows/build-attested.yml"
+            echo "gh attestation verify oci://docker.io/hyperledger/besu:${VERSION} -R besu-eth/besu"
+            echo "gh release verify ${VERSION} -R besu-eth/besu"
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create or update draft release
+        # The draft is addressed by the FINAL version. Its tag does not exist
+        # yet: github creates the (immutable) final tag at target_commitish
+        # when the release engineer publishes. Each subsequent RC re-points
+        # the same draft and replaces its assets.
+        run: |
+          assets=(
+            "besu-${VERSION}.tar.gz"
+            "besu-${VERSION}.zip"
+            "besu-${VERSION}.tar.gz.sha256"
+            "besu-${VERSION}.zip.sha256"
+            "besu-${VERSION}.sbom.cdx.json"
+            "besu-${VERSION}.checksums.txt"
+          )
+          if gh release view "${VERSION}" --json isDraft --jq .isDraft 2>/dev/null | grep -q true; then
+            echo "Updating existing draft ${VERSION} -> target ${RC_SHA} (${RC_TAG})"
+            gh release edit "${VERSION}" --draft --target "${RC_SHA}" --title "${VERSION}" --notes-file release-notes.md
+            gh release upload "${VERSION}" "${assets[@]}" --clobber
+          else
+            echo "Creating draft ${VERSION} -> target ${RC_SHA} (${RC_TAG})"
+            gh release create "${VERSION}" \
+              --draft \
+              --target "${RC_SHA}" \
+              --title "${VERSION}" \
+              --notes-file release-notes.md \
+              "${assets[@]}"
+          fi

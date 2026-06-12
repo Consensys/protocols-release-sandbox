@@ -1,0 +1,76 @@
+name: Release Prep
+
+run-name: "Release Prep ${{ inputs.version }}"
+
+# Opens the CHANGELOG rotation PR for an upcoming release: renames
+# '## Unreleased' to '## <version>' and inserts a fresh Unreleased section.
+# Run this BEFORE cutting the first RC tag, so the tag carries a correct
+# versioned CHANGELOG section (release notes are composed from the tag).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to rotate the CHANGELOG to, e.g. 26.7.0"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rotate:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate version
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$VERSION' is not a valid version (x.y.z)"
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+
+      - name: Rotate CHANGELOG
+        run: |
+          if ! grep -q '^## Unreleased' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## Unreleased' section to rotate"
+            exit 1
+          fi
+          if grep -q "^## ${VERSION}\$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md already has a '## ${VERSION}' section"
+            exit 1
+          fi
+          # Rename the first Unreleased heading and insert a fresh one above it.
+          awk -v ver="$VERSION" '
+            !done && /^## Unreleased/ {
+              print "## Unreleased"
+              print ""
+              print "## " ver
+              done=1
+              next
+            }
+            {print}
+          ' CHANGELOG.md > CHANGELOG.md.new
+          mv CHANGELOG.md.new CHANGELOG.md
+
+      - name: Open rotation PR
+        run: |
+          branch="changelog-rotation-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add CHANGELOG.md
+          git commit -s -m "changelog rotation for ${VERSION}"
+          git push origin "$branch"
+          gh pr create \
+            --title "changelog rotation for ${VERSION}" \
+            --body "Renames \`## Unreleased\` to \`## ${VERSION}\` ahead of cutting ${VERSION}-RC1. Opened by the Release Prep workflow." \
+            --base main \
+            --head "$branch"

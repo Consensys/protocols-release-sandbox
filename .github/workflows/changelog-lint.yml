@@ -1,0 +1,78 @@
+name: Changelog Lint
+
+# New CHANGELOG entries must land under '## Unreleased'. Versioned sections
+# describe shipped (or in-flight) releases whose notes are composed from the
+# CHANGELOG at the release tag — editing them after the fact creates the
+# tag-vs-main drift that required cleanup PRs in the 26.4.0/26.5.0 cycles.
+#
+# Heading lines themselves are exempt so the release-prep rotation PR
+# ('## Unreleased' -> '## <version>') passes.
+
+on:
+  pull_request:
+    paths:
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Check changed lines are under Unreleased
+        run: |
+          python3 - <<'EOF'
+          import re, subprocess, sys
+
+          base = "origin/${{ github.base_ref }}"
+          subprocess.run(["git", "fetch", "--quiet", "origin", "${{ github.base_ref }}"], check=True)
+          diff = subprocess.run(
+              ["git", "diff", "-U0", f"{base}...HEAD", "--", "CHANGELOG.md"],
+              capture_output=True, text=True, check=True).stdout
+
+          added = []  # line numbers in the new file
+          new_line = 0
+          for line in diff.splitlines():
+              m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+              if m:
+                  new_line = int(m.group(1))
+                  continue
+              if line.startswith("+") and not line.startswith("+++"):
+                  added.append(new_line)
+                  new_line += 1
+              elif not line.startswith("-"):
+                  new_line += 1
+
+          if not added:
+              sys.exit(0)
+
+          contents = open("CHANGELOG.md").read().splitlines()
+          heading_re = re.compile(r"^## (.+?)\s*$")
+          version_re = re.compile(r"^\d+\.\d+")
+
+          violations = []
+          for n in added:
+              text = contents[n - 1] if n - 1 < len(contents) else ""
+              if heading_re.match(text):
+                  continue  # heading add/rename (release-prep rotation) is allowed
+              section = None
+              for i in range(n - 1, -1, -1):
+                  m = heading_re.match(contents[i]) if i < len(contents) else None
+                  if m:
+                      section = m.group(1)
+                      break
+              if section and version_re.match(section):
+                  violations.append((n, section, text))
+
+          if violations:
+              for n, section, text in violations:
+                  print(f"::error file=CHANGELOG.md,line={n}::entry added under released section '## {section}' — new entries belong under '## Unreleased'")
+              sys.exit(1)
+          print("CHANGELOG changes confined to Unreleased")
+          EOF
