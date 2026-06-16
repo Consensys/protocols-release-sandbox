@@ -1,7 +1,6 @@
-name: pre-review
+name: CI
 
 on:
-  merge_group:
   pull_request:
     branches:
       - main
@@ -17,7 +16,8 @@ env:
   GRADLE_OPTS: "-Xmx6g -Dorg.gradle.parallel=true"
 
 jobs:
-  repolint:
+
+  repoLint:
     name: "Repository Linting"
     runs-on: ubuntu-latest
     container: ghcr.io/todogroup/repolinter:v0.11.2
@@ -28,7 +28,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
       - name: Lint Repo
         run: bundle exec /app/bin/repolinter.js --rulesetUrl https://raw.githubusercontent.com/hyperledger-labs/hyperledger-community-management-tools/main/repo_structure/repolint.json --format markdown
-  gradle-wrapper:
+
+  gradleWrapper:
     name: "Gradle Wrapper Validation"
     runs-on: ubuntu-latest
     steps:
@@ -36,7 +37,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
       - uses: gradle/actions/wrapper-validation@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
-  spotless-checkLicense:
+
+  spotlessCheckLicense:
     name: "Spotless & Check License"
     runs-on: ubuntu-latest
     steps:
@@ -62,10 +64,11 @@ jobs:
         with:
           name: checkLicense
           path: build/reports/dependency-license
+
   compile:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [spotless-checkLicense, gradle-wrapper, repolint]
+    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -82,10 +85,35 @@ jobs:
           cache-disabled: true
       - name: Gradle Compile
         run: ./gradlew build -x test -x spotlessCheck
-  verify-source-metadata:
+      - name: Upload tar.gz
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: besu-tar
+          path: build/distributions/besu-*.tar.gz
+          retention-days: 10
+      - name: Upload zip
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: besu-zip
+          path: build/distributions/besu-*.zip
+          retention-days: 10
+      - name: Upload workspace build
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: assemble-output
+          path: |
+            ./
+            !./.git/**
+          retention-days: 1
+          include-hidden-files: 'true'
+
+  # Supply chain security: verifies that source JARs for all dependencies are recorded
+  # in verification-metadata.xml. Prevents tampered or undeclared source artifacts
+  # from being introduced without explicit sign-off.
+  verifySourceMetadata:
     name: "Verify Dependency Source Metadata"
     runs-on: ubuntu-latest
-    needs: [spotless-checkLicense, gradle-wrapper, repolint]
+    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -102,59 +130,62 @@ jobs:
           cache-disabled: true
       - name: Verify source artifacts recorded in verification-metadata.xml
         run: ./gradlew verifySourceArtifacts
+
+  # Tests
+  # Each suite has its suite-tests-passed job in the file directly
   unitTests:
-    runs-on: besu-research-ubuntu-16 # more cores
-    timeout-minutes: 30
-    needs: [spotless-checkLicense, gradle-wrapper, repolint]
+    needs: compile
     permissions:
+      actions: read
+      contents: read
       checks: write
       statuses: write
-    strategy:
-      fail-fast: true
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: Set up Java
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
-        with:
-          distribution: temurin
-          java-version: 25
-      - name: Install required packages
-        run:  sudo apt-get install -y xmlstarlet
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
-        with:
-          cache-disabled: true
-          add-job-summary: on-failure
-      - name: run unit tests
-        env:
-          # reducing JVM forks to increase reuse of setup code such as SignatureAlgorithm
-          GRADLE_MAX_TEST_FORKS: 2 # besu-research-ubuntu-16 will use 8 by default
-        run: ./gradlew -Dorg.gradle.parallel=true -Dorg.gradle.caching=true test
-      - name: Upload Unit Test Results
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: unit-test-results
-          path: '**/test-results/**/TEST-*.xml'
-      - name: Upload Unit Test HTML Reports
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        if: success() || failure()
-        with:
-          name: unit-test-html-reports
-          path: '**/build/reports/tests/test/**'
-  unittests-passed:
-    name: "unittests-passed"
+    uses: ./.github/workflows/unit-tests.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+
+  integrationTests:
+    needs: compile
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+      statuses: write      
+    uses: ./.github/workflows/integration-tests.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+
+  referenceTests:
+    needs: compile
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      checks: write
+      statuses: write      
+    uses: ./.github/workflows/reference-tests.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+    secrets: inherit
+
+  acceptanceTests:
+    needs: compile
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+      statuses: write
+    uses: ./.github/workflows/acceptance-tests.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+    secrets: inherit
+
+  allTestsPassed:
+    name: allTestsPassed
     runs-on: ubuntu-latest
-    needs: [compile, unitTests, verify-source-metadata]
-    permissions:
-      checks: write
-      statuses: write
+    needs: [verifySourceMetadata, unitTests, integrationTests, referenceTests, acceptanceTests]
     if: always()
     steps:
-      # Fail if any `needs` job was not a success.
-      # Along with `if: always()`, this allows this job to act as a single required status check for the entire workflow.
       - name: Fail on workflow error
         run: exit 1
         if: >-
@@ -163,17 +194,3 @@ jobs:
             || contains(needs.*.result, 'cancelled')
             || contains(needs.*.result, 'skipped')
           }}
-      - name: Checkout Repo
-        if: always()
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: Download all unit test results
-        if: always()
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: unit-test-results
-          merge-multiple: true
-      - name: Report 10 slowest tests
-        if: always()
-        run: python3 .github/workflows/reportSlowestTests.sh 10
