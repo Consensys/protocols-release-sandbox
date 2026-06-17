@@ -36,8 +36,15 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ github.workspace }}
 
-      - name: Setup Java and Gradle
-        uses: consensys/github-actions/java-setup-gradle@2a7c66c86174927c67f7eb444bc4fd605ce680c1
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+        with:
+          cache-disabled: true
 
       - name: Run unit tests
         env:
@@ -78,9 +85,3 @@ jobs:
             || contains(needs.*.result, 'cancelled')
             || contains(needs.*.result, 'skipped')
           }}
-      # - name: Report 10 slowest tests
-      #   if: always()
-      #   uses: consensys/github-actions/java-report-slowest-tests@2a7c66c86174927c67f7eb444bc4fd605ce680c1
-      #   with:
-      #     count: 10
-      #     artifact_pattern: unit-test-results

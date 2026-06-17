@@ -140,7 +140,7 @@ jobs:
           username: ${{ secrets.DOCKER_USER_RW }}
           password: ${{ secrets.DOCKER_PASSWORD_RW }}
       - name: Install cosign
-        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
       - name: Sign image with keyless cosign
         env:
           IMAGE_DIGEST: ${{ needs.publishDocker.outputs.image_digest }}
