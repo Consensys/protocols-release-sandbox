@@ -1,0 +1,190 @@
+name: publish-docker
+
+on:
+  workflow_call:
+    inputs:
+      assemble_run_id:
+        required: true
+        type: string
+      push:
+        required: false
+        type: boolean
+        default: false
+      cache_scope:
+        required: false
+        type: string
+        default: 'docker-build'
+
+jobs:
+  buildTestDocker:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      buildVersion: ${{ steps.buildDetails.outputs.buildVersion }}
+      dockertags: ${{ steps.buildDetails.outputs.dockertags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Download assemble-output
+        if: ${{ github.event_name == 'workflow_call' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.assemble_run_id }}
+          name: assemble-output
+          merge-multiple: true
+          path: ${{ github.workspace }}
+      - name: Get build details
+        id: buildDetails
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "buildVersion=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            dockertags="hyperledger/besu:${{ github.ref_name }}"
+            if [[ "${{ github.ref_name }}" != *"-rc"* ]]; then
+              dockertags="${dockertags},hyperledger/besu:latest"
+            fi
+          else
+            echo "buildVersion=develop" >> $GITHUB_OUTPUT
+            dockertags="hyperledger/besu:develop"
+          fi
+          echo "dockertags=${dockertags}" >> $GITHUB_OUTPUT
+      - name: Stage Docker build context
+        run: ./gradlew --no-daemon distDockerCopy
+      - name: Build and load amd64 image for testing
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        env:
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          context: build/docker-besu
+          load: true
+          build-args: |
+            VERSION=${{ steps.buildDetails.outputs.buildVersion }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.buildDetails.outputs.build_date }}
+          tags: hyperledger/besu:test
+          cache-from: type=gha,scope=${{ inputs.cache_scope || 'docker-build' }}-amd64
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache_scope || 'docker-build' }}-amd64
+      - name: Download Goss binaries
+        run: |
+          GOSS_VERSION="v0.4.9"
+          TEST_DIR="docker/tests"
+          curl -fsSL "https://github.com/goss-org/goss/releases/download/${GOSS_VERSION}/goss-linux-amd64" \
+            -o "${TEST_DIR}/goss-linux-amd64"
+          chmod +x "${TEST_DIR}/goss-linux-amd64"
+          curl -fsSL "https://github.com/goss-org/goss/releases/download/${GOSS_VERSION}/dgoss" \
+            -o "${TEST_DIR}/dgoss"
+          chmod +x "${TEST_DIR}/dgoss"
+      - name: Run Docker tests
+        env:
+          architecture: amd64
+        run: |
+          mkdir -p docker/reports
+          cd docker && ./test.sh hyperledger/besu:test
+
+  publishDocker:
+    needs: buildTestDocker
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    outputs:
+      image_digest: ${{ steps.dockerBuildPush.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Stage Docker build context
+        run: ./gradlew --no-daemon distDockerCopy
+      - name: Login to Docker Hub
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: ${{ secrets.DOCKER_USER_RW }}
+          password: ${{ secrets.DOCKER_PASSWORD_RW }}
+      - name: Build and push multi-arch manifest
+        id: dockerBuildPush
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        env:
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          context: build/docker-besu
+          platforms: linux/arm64,linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=${{ inputs.cache_scope || 'docker-build' }}-amd64
+          build-args: |
+            VERSION=${{ needs.buildTestDocker.outputs.buildVersion }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.buildDetails.outputs.build_date }}
+          push: true
+          tags: ${{ needs.buildTestDocker.outputs.dockertags }}
+
+  signAndAttest:
+    runs-on: ubuntu-24.04
+    needs: publishDocker
+    if: ${{ needs.publishDocker.result == 'success' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+    permissions:
+      id-token: write
+    environment: publish
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: ${{ secrets.DOCKER_USER_RW }}
+          password: ${{ secrets.DOCKER_PASSWORD_RW }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22
+      - name: Sign image with keyless cosign
+        env:
+          IMAGE_DIGEST: ${{ needs.publishDocker.outputs.image_digest }}
+        run: |
+          IMAGE=docker.io/hyperledger/besu@$IMAGE_DIGEST
+          echo "Signing $IMAGE"
+          cosign sign --yes $IMAGE
+      - name: Generate provenance file
+        run: |
+          BUILD_STARTED_ON="${{ github.event.head_commit.timestamp }}"
+          if [ -z "$BUILD_STARTED_ON" ]; then
+            BUILD_STARTED_ON=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          fi
+          BUILD_FINISHED_ON=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          cat > provenance.json <<'EOF'
+          {
+            "buildType": "https://slsa.dev/container/v1",
+            "builder": {
+              "id": "https://github.com/${{ github.repository }}/.github/workflows/${{ github.workflow_ref }}"
+            },
+            "invocation": {
+              "parameters": {
+                "git_ref": "${{ github.ref }}",
+                "git_sha": "${{ github.sha }}",
+                "build_run_id": "${{ github.run_id }}",
+                "build_run_number": "${{ github.run_number }}"
+              }
+            },
+            "metadata": {
+              "buildStartedOn": "__BUILD_STARTED_ON__",
+              "buildFinishedOn": "__BUILD_FINISHED_ON__"
+            },
+            "source": {
+              "repository": "https://github.com/${{ github.repository }}",
+              "revision": "${{ github.sha }}"
+            }
+          }
+          EOF
+          sed -i "s/__BUILD_STARTED_ON__/$BUILD_STARTED_ON/" provenance.json
+          sed -i "s/__BUILD_FINISHED_ON__/$BUILD_FINISHED_ON/" provenance.json
+      - name: Attest cosign provenance
+        env:
+          IMAGE_DIGEST: ${{ needs.publishDocker.outputs.image_digest }}
+        run: |
+          IMAGE=docker.io/hyperledger/besu@$IMAGE_DIGEST
+          echo "Attesting provenance for $IMAGE"
+          cosign attest --yes --predicate provenance.json --type slsaprovenance $IMAGE

@@ -298,7 +298,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          sparse-checkout: '.github/workflows/BesuContainerVerify.sh'
+          sparse-checkout: '.github/scripts/BesuContainerVerify.sh'
 
       - name: Start container
         run: |
@@ -307,7 +307,7 @@ jobs:
           docker run -d $PLATFORM_OPT --name ${{ env.CONTAINER_NAME }} ${{ secrets.DOCKER_ORG }}/besu:${{ matrix.combination.tag }}
 
       - name: Verify besu container
-        run: bash .github/workflows/BesuContainerVerify.sh
+        run: bash .github/scripts/BesuContainerVerify.sh
         env:
           TAG: ${{ matrix.combination.tag }}
           VERSION: ${{ env.RELEASE_VERSION }}
@@ -406,4 +406,4 @@ jobs:
         run: pip install requests argparse
 
       - name: Run the script
-        run: python3 .github/workflows/verify_artifacts.py --besu_version="${{ needs.validate.outputs.release_version }}"
+        run: python3 .github/scripts/verifyArtifacts.py --besu_version="${{ needs.validate.outputs.release_version }}"
