@@ -20,13 +20,13 @@ env:
 
 # Job matrix:
 #
-#   push to main:  repoLint, gradleWrapper, spotlessCheckLicense → compile → dockerBuildTest
-#                  dockerBuildTest calls docker-publish.yml which builds, goss-tests, and
-#                  publishes the `develop` Docker image because github.ref == refs/heads/main.
+#   push to main:  repoLint, gradleWrapper, spotlessCheckLicense → compile
+#                    → dockerBuildTest (docker-build-test.yml: build + goss-test)
+#                    → dockerPublish   (docker-publish.yml: push `develop` image + sign)
 #
-#   pull_request:  all of the above PLUS verifySourceMetadata, unitTests, integrationTests,
+#   pull_request:  all of the above (dockerPublish skipped — not on main) PLUS
+#                  verifySourceMetadata, unitTests, integrationTests,
 #                  referenceTests, acceptanceTests → allTestsPassed (PR merge gate).
-#                  dockerBuildTest builds and goss-tests only; does NOT publish.
 
 jobs:
 
@@ -200,10 +200,18 @@ jobs:
 
   dockerBuildTest:
     needs: compile
-    uses: ./.github/workflows/docker-publish.yml
+    uses: ./.github/workflows/docker-build-test.yml
     with:
       assemble_run_id: ${{ github.run_id }}
-      push: false
+      cache_scope: ci-pr-build
+    secrets: inherit
+
+  dockerPublish:
+    needs: [compile, dockerBuildTest]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      version: develop
       cache_scope: ci-pr-build
     secrets: inherit
 
