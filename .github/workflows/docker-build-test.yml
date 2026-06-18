@@ -81,6 +81,7 @@ jobs:
       - name: Run Docker tests
         env:
           architecture: amd64
+          EXPECTED_VERSION: ${{ inputs.version }}
         run: |
           mkdir -p docker/reports
           cd docker && ./test.sh hyperledger/besu:test

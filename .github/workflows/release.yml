@@ -3,24 +3,30 @@ name: Release
 # Job flow:
 #
 #   build               ← validate tag (X.Y.Z or X.Y.Z-RCN, inline), gradle assemble,
-#                         sha256 hashes, upload distribution artifacts (7-day retention)
+#                         sha256 hashes, upload distribution artifacts (14-day retention)
 #     │
 #   docker-build-test   ← checkout tag, distDockerCopy, build amd64, goss tests (no push)
 #     │
 #   draft-release       ← gh release create --draft + release notes template + artifacts
-#     │
+#     │               
+#     │                 ← burn in happens here
+#     │               
 #   release-gate        ← environment: "release-approval" — blocks for maintainer approval
 #     │
-#     ├────────────────────────────────┐
-#   publish-docker             publish-artifactory
-#   (multi-arch push,          (gradle artifactoryPublish)
-#    cosign sign + attest)
-#     └────────────────────────────────┘
-#                  │
-#            finalize-release  ← gh release edit --draft=false
+#     │
+#   publish-artifactory ← gradle artifactoryPublish)
+#     │               
+#   verify-artifactory  
+#     │     
+#   publish-docker             
+#   (multi-arch push, cosign sign + attest)
+#     │
+#   finalize-release  ← gh release edit --draft=false
+
 
 on:
   push:
+    # match tags X.Y.Z and X.Y.Z-RCn
     tags:
       - '[0-9]*.[0-9]*.[0-9]*'
 
@@ -67,7 +73,7 @@ jobs:
           name: besu-${{ github.ref_name }}.tar.gz
           path: build/distributions/besu-${{ github.ref_name }}.tar.gz
           compression-level: 0
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload zip
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -75,21 +81,21 @@ jobs:
           name: besu-${{ github.ref_name }}.zip
           path: build/distributions/besu-${{ github.ref_name }}.zip
           compression-level: 0
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload tar.gz sha256
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: besu-${{ github.ref_name }}.tar.gz.sha256
           path: build/distributions/besu-${{ github.ref_name }}.tar.gz.sha256
-          retention-days: 7
+          retention-days: 14
 
       - name: Upload zip sha256
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: besu-${{ github.ref_name }}.zip.sha256
           path: build/distributions/besu-${{ github.ref_name }}.zip.sha256
-          retention-days: 7
+          retention-days: 14
 
   docker-build-test:
     needs: build
@@ -152,16 +158,6 @@ jobs:
     steps:
       - run: echo "Release ${{ github.ref_name }} approved"
 
-  publish-docker:
-    needs: release-gate
-    permissions:
-      id-token: write
-    uses: ./.github/workflows/docker-publish.yml
-    with:
-      version: ${{ github.ref_name }}
-      cache_scope: release-build
-    secrets: inherit
-
   publish-artifactory:
     needs: release-gate
     runs-on: ubuntu-latest
@@ -188,8 +184,38 @@ jobs:
           ARTIFACTORY_KEY: ${{ secrets.BESU_ARTIFACTORY_TOKEN }}
         run: ./gradlew -Prelease.releaseVersion=${{ github.ref_name }} -Pversion=${{ github.ref_name }} artifactoryPublish
 
+  verify-artifactory:
+    runs-on: ubuntu-latest
+    needs: publish-artifactory
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install requests argparse
+
+      - name: Run the script
+        run: python3 .github/scripts/verifyArtifacts.py --besu_version="${{ github.ref_name }}"
+
+  publish-docker:
+    needs: [release-gate, publish-artifactory, verify-artifactory]
+    permissions:
+      id-token: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      version: ${{ github.ref_name }}
+      cache_scope: release-build
+    secrets: inherit
+
+
   finalize-release:
-    needs: [publish-docker, publish-artifactory]
+    needs: [publish-docker, publish-artifactory, verify-artifactory]
     runs-on: ubuntu-latest
     permissions:
       contents: write
