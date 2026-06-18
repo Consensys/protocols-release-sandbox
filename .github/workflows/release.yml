@@ -11,7 +11,7 @@ name: Release
 #     │               
 #     │                 ← burn in happens here
 #     │               
-#   release-gate        ← environment: "release-approval" — blocks for maintainer approval
+#   releaseGate        ← environment: "release-approval" — blocks for maintainer approval
 #     │
 #     │
 #   publish-artifactory ← gradle artifactoryPublish)
@@ -97,15 +97,15 @@ jobs:
           path: build/distributions/besu-${{ github.ref_name }}.zip.sha256
           retention-days: 14
 
-  docker-build-test:
+  dockerBuildTest:
     needs: build
     uses: ./.github/workflows/docker-build-test.yml
     with:
       version: ${{ github.ref_name }}
       cache_scope: release-build
 
-  draft-release:
-    needs: [build, docker-build-test]
+  draftRelease:
+    needs: [build, dockerBuildTest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -151,15 +151,15 @@ jobs:
             besu-${{ github.ref_name }}.tar.gz.sha256
 
   # maintainer needs to approve this after burnin tests
-  release-gate:
-    needs: draft-release
+  releaseGate:
+    needs: draftRelease
     runs-on: ubuntu-latest
     environment: release-approval
     steps:
       - run: echo "Release ${{ github.ref_name }} approved"
 
-  publish-artifactory:
-    needs: release-gate
+  publishArtifactory:
+    needs: releaseGate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tag
@@ -184,9 +184,9 @@ jobs:
           ARTIFACTORY_KEY: ${{ secrets.BESU_ARTIFACTORY_TOKEN }}
         run: ./gradlew -Prelease.releaseVersion=${{ github.ref_name }} -Pversion=${{ github.ref_name }} artifactoryPublish
 
-  verify-artifactory:
+  verifyArtifactory:
     runs-on: ubuntu-latest
-    needs: publish-artifactory
+    needs: publishArtifactory
     steps:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -203,8 +203,8 @@ jobs:
       - name: Run the script
         run: python3 .github/scripts/verifyArtifacts.py --besu_version="${{ github.ref_name }}"
 
-  publish-docker:
-    needs: [release-gate, publish-artifactory, verify-artifactory]
+  publishDocker:
+    needs: [publishArtifactory, verifyArtifactory]
     permissions:
       id-token: write
     uses: ./.github/workflows/docker-publish.yml
@@ -214,8 +214,8 @@ jobs:
     secrets: inherit
 
 
-  finalize-release:
-    needs: [publish-docker, publish-artifactory, verify-artifactory]
+  finalizeRelease:
+    needs: [publishArtifactory, verifyArtifactory, publishDocker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
