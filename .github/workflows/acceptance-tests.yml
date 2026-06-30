@@ -1,4 +1,5 @@
 name: acceptance-tests
+
 on:
   workflow_call:
     inputs:
