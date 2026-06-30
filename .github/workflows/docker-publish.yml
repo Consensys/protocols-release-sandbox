@@ -18,6 +18,8 @@ on:
 jobs:
   publishDocker:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       image_digest: ${{ steps.dockerBuildPush.outputs.digest }}
     steps:

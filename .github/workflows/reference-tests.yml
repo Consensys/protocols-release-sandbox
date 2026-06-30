@@ -16,6 +16,7 @@ jobs:
     runs-on: besu-research-ubuntu-8 # since eest-v5.1.0 this job needs more disk space
     timeout-minutes: 30
     permissions:
+      contents: read
       statuses: write
       checks: write
       packages: read

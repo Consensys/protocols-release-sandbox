@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 30
     name: "Acceptance Runner"
     permissions:
+      contents: read
       statuses: write
       checks: write
     strategy:
