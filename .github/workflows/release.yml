@@ -206,6 +206,7 @@ jobs:
   publishDocker:
     needs: [publishArtifactory, verifyArtifactory]
     permissions:
+      contents: read
       id-token: write
     uses: ./.github/workflows/docker-publish.yml
     with:
