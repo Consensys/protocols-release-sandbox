@@ -2,10 +2,6 @@ name: reference-tests
 
 on:
   workflow_call:
-    inputs:
-      assemble_output_run_id:
-        type: string
-        required: true
 
 env:
   GRADLE_OPTS: "-Xmx6g -Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
@@ -30,13 +26,6 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
           submodules: recursive
-      - name: Download assemble-output
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: assemble-output
-          run-id: ${{ inputs.assemble_output_run_id }}
-          github-token: ${{ github.token }}
-          path: ${{ github.workspace }}
       - name: Set up Java
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:

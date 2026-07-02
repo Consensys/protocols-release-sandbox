@@ -21,13 +21,15 @@ env:
 
 # Job matrix:
 #
-#   push to main:  repoLint, gradleWrapper, spotlessCheckLicense → compile
+#   push to main:      [repoLint, gradleWrapper, spotlessCheckLicense]
+#                    → compile
 #                    → dockerBuildTest (docker-build-test.yml: build + goss-test)
 #                    → dockerPublish   (docker-publish.yml: push `develop` image + sign)
 #
-#   pull_request:  all of the above (dockerPublish skipped — not on main) PLUS
-#                  verifySourceMetadata, unitTests, integrationTests,
-#                  referenceTests, acceptanceTests → allTestsPassed (PR merge gate).
+#   pull_request:    [repoLint, gradleWrapper, spotlessCheckLicense]
+#                  → [compile, verifySourceMetadata, unitTests, integrationTests, referenceTests, acceptanceTests]
+#                  → dockerBuildTest (docker-build-test.yml: build + goss-test; dockerPublish skipped - not on main)
+#                  → allTestsPassed (PR merge gate).
 
 jobs:
 
@@ -150,31 +152,27 @@ jobs:
   # Each suite has its suite-tests-passed job in the file directly
   unitTests:
     if: github.event_name == 'pull_request'
-    needs: compile
+    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
       checks: write
       statuses: write
     uses: ./.github/workflows/unit-tests.yml
-    with:
-      assemble_output_run_id: ${{ github.run_id }}
 
   integrationTests:
     if: github.event_name == 'pull_request'
-    needs: compile
+    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
       checks: write
       statuses: write      
     uses: ./.github/workflows/integration-tests.yml
-    with:
-      assemble_output_run_id: ${{ github.run_id }}
 
   referenceTests:
     if: github.event_name == 'pull_request'
-    needs: compile
+    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
@@ -182,21 +180,17 @@ jobs:
       checks: write
       statuses: write      
     uses: ./.github/workflows/reference-tests.yml
-    with:
-      assemble_output_run_id: ${{ github.run_id }}
     secrets: inherit
 
   acceptanceTests:
     if: github.event_name == 'pull_request'
-    needs: compile
+    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
       checks: write
       statuses: write
     uses: ./.github/workflows/acceptance-tests.yml
-    with:
-      assemble_output_run_id: ${{ github.run_id }}
     secrets: inherit
 
   dockerBuildTest:
