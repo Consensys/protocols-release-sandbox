@@ -21,12 +21,12 @@ env:
 
 # Job matrix:
 #
-#   push to main:      [repoLint, gradleWrapper, spotlessCheckLicense]
+#   push to main:      [repoLint, gradleWrapper, spotless, checkLicense, javadoc]
 #                    → compile
 #                    → dockerBuildTest (docker-build-test.yml: build + goss-test)
 #                    → dockerPublish   (docker-publish.yml: push `develop` image + sign)
 #
-#   pull_request:    [repoLint, gradleWrapper, spotlessCheckLicense]
+#   pull_request:    [repoLint, gradleWrapper, spotless, checkLicense, javadoc]
 #                  → [compile, verifySourceMetadata, unitTests, integrationTests, referenceTests, acceptanceTests]
 #                  → dockerBuildTest (docker-build-test.yml: build + goss-test; dockerPublish skipped - not on main)
 #                  → allTestsPassed (PR merge gate).
@@ -54,8 +54,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
       - uses: gradle/actions/wrapper-validation@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
 
-  spotlessCheckLicense:
-    name: "Spotless & Check License"
+  spotless:
+    name: "Spotless"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
@@ -73,6 +73,24 @@ jobs:
           cache-disabled: true
       - name: run spotless
         run: ./gradlew spotlessCheck
+
+  checkLicense:
+    name: "Check License"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+        with:
+          cache-disabled: true
       - name: run checkLicense
         run: ./gradlew --no-parallel checkLicense # no-parallel due to https://github.com/jk1/Gradle-License-Report/issues/337
       - name: upload license report
@@ -81,10 +99,33 @@ jobs:
           name: checkLicense
           path: build/reports/dependency-license
 
+  # Javadoc is strict (Xdoclint:all) and a common gotcha; run it as its own first-stage
+  # gate on compile. It recompiles main sources, so it is heavier than spotless/checkLicense.
+  javadoc:
+    name: "Javadoc"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+        with:
+          cache-disabled: true
+      - name: run javadoc
+        run: ./gradlew javadoc
+
   compile:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
+    needs: [spotless, checkLicense, javadoc, gradleWrapper, repoLint]
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -100,7 +141,7 @@ jobs:
         with:
           cache-disabled: true
       - name: Gradle Compile
-        run: ./gradlew build -x test -x spotlessCheck
+        run: ./gradlew build -x test -x spotlessCheck -x javadoc
       - name: Upload tar.gz
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -130,7 +171,7 @@ jobs:
     name: "Verify Dependency Source Metadata"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
+    needs: [spotless, checkLicense, gradleWrapper, repoLint]
     steps:
       - name: Checkout Repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -152,7 +193,7 @@ jobs:
   # Each suite has its suite-tests-passed job in the file directly
   unitTests:
     if: github.event_name == 'pull_request'
-    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
+    needs: [spotless, checkLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
@@ -162,7 +203,7 @@ jobs:
 
   integrationTests:
     if: github.event_name == 'pull_request'
-    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
+    needs: [spotless, checkLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
@@ -172,7 +213,7 @@ jobs:
 
   referenceTests:
     if: github.event_name == 'pull_request'
-    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
+    needs: [spotless, checkLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
@@ -184,7 +225,7 @@ jobs:
 
   acceptanceTests:
     if: github.event_name == 'pull_request'
-    needs: [spotlessCheckLicense, gradleWrapper, repoLint]
+    needs: [spotless, checkLicense, gradleWrapper, repoLint]
     permissions:
       actions: read
       contents: read
