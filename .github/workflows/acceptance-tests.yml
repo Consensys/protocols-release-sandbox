@@ -8,7 +8,39 @@ env:
   total-runners: 14
 
 jobs:
+  listAcceptanceTests:
+    name: "List Acceptance Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+      - name: List all acceptance tests
+        # Scan source files for JUnit-annotated concrete test classes (mirrors the Gradle task's
+        # exclude '**/bftsoak/**' — soak tests run in a separate workflow).
+        # This avoids triggering `installDist` (which the acceptanceTest Gradle task depends on)
+        # just to enumerate test class names.
+        run: |
+          mkdir tmp
+          find acceptance-tests/tests/src/acceptanceTest/java -name '*.java' \
+            | grep -v '/bftsoak/' \
+            | xargs grep -lE '@(Test|ParameterizedTest|BeforeAll|BeforeEach|AfterAll|AfterEach|TestFactory|RepeatedTest)\b' \
+            | xargs grep -L 'abstract class' \
+            | sed 's|.*/acceptanceTest/java/||; s|/|.|g; s|\.java$||' \
+            | awk '{print $0 " acceptanceTest"}' \
+            > tmp/currentTests.list
+      - name: Upload test list
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: acceptance-tests-current-list
+          path: tmp/currentTests.list
+
   acceptanceTests:
+    needs: [ listAcceptanceTests ]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     name: "Acceptance Runner"
@@ -36,14 +68,11 @@ jobs:
           cache-disabled: true
       - name: Install required packages
         run:  sudo apt-get install -y xmlstarlet
-      - name: setup gradle
-        uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f # v6.0.1
+      - name: Download current test list
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          cache-disabled: true
-      - name: List all acceptance tests
-        run: ./gradlew acceptanceTest --test-dry-run -Dorg.gradle.parallel=true -Dorg.gradle.caching=true
-      - name: Extract current test list
-        run: mkdir tmp; find . -type f -name TEST-*.xml | xargs -I{} bash -c "xmlstarlet sel -t -v '/testsuite/testcase[1]/@classname' '{}'; echo ' acceptanceTest'" | tee tmp/currentTests.list
+          name: acceptance-tests-current-list
+          path: tmp
       # Downloads the timing baseline produced by update-acceptance-tests-timing-reports.yml on the last merge to main.
       # `splitTestsByTime.sh` uses the per-test durations in  these XMLs to distribute tests across parallel runners by historical wall-clock time rather than a naive split.
       # If the artifact is missing # (e.g. first run), splitting falls back to round-robin for all tests.
